@@ -1,0 +1,7 @@
+[package]
+name = "vidman"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+seify-hackrfone = "0.2.2"
