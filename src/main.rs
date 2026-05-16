@@ -4,6 +4,11 @@ use std::{
     fs::File,
     io::{self, Write},
 };
+
+use crate::dsp::{
+    demod::FmDemod,
+    fir::{Fir, RealFir},
+};
 mod dsp;
 
 const BLOCK_SIZE: usize = 480_000;
@@ -21,6 +26,7 @@ struct Cli {
 enum Commands {
     Capture,
     Meter,
+    Demod,
 }
 
 fn main() {
@@ -30,6 +36,7 @@ fn main() {
             capture();
         }
         Commands::Meter => meter().expect("meter"),
+        Commands::Demod => demod().expect("demod"),
     }
 }
 
@@ -146,4 +153,63 @@ fn draw_bar<W: Write>(out: &mut W, mean: f32) {
 
     write!(out, "\r|{bar}| {mean:.4}").expect("write");
     out.flush().expect("flush");
+}
+
+fn demod() -> anyhow::Result<()> {
+    use dsp::mixer::Mixer;
+    use num_complex::Complex32;
+
+    // read bytes to mem
+    let bytes = std::fs::read("cap.cs8")?;
+    eprintln!(
+        "read {} bytes ({:.2} s @ 2.4 Msps)",
+        bytes.len(),
+        bytes.len() as f32 / 4_800_000.0
+    );
+
+    // convert i8 IQ -> Complex32
+    let iq: Vec<Complex32> = bytes
+        .chunks_exact(2)
+        .map(|chunk| {
+            let [raw_i, raw_q] = chunk else {
+                unreachable!()
+            };
+            let i = (*raw_i as i8) as f32 / 128.0;
+            let q = (*raw_q as i8) as f32 / 128.0;
+            // sum += (i * i + q * q).sqrt();
+            Complex32::new(i, q)
+        })
+        .collect();
+
+    // shift station from -200kHz to DC
+    let mut mixer = Mixer::new(200_000.0, 2_400_000.0);
+    let mixed: Vec<Complex32> = iq.into_iter().map(|s| mixer.mix(s)).collect();
+
+    // first FIR; low-pass @ 100kHz; 2,400 ksps -> 240 ksps
+    let mut fir1 = Fir::new(63, 100_000.0, 2_400_000.0, 10);
+    let mut decimated = Vec::with_capacity(mixed.len() / 10 + 1);
+    fir1.process(&mixed, &mut decimated);
+
+    // fm demod; complex -> audio (240 ksps)
+    let mut fm = FmDemod::new();
+    let mut audio_hi = Vec::with_capacity(decimated.len());
+    fm.process(&decimated, &mut audio_hi);
+
+    // audio FIR; low-pass @ 15kHz; 240 ksps -> 48 ksps
+    let mut fir2 = RealFir::new(63, 15_000.0, 240_000.0, 5);
+    let mut audio: Vec<f32> = Vec::with_capacity(audio_hi.len() / 5 + 1);
+    fir2.process(&audio_hi, &mut audio);
+
+    // write raw f32
+    let mut out = std::fs::File::create("demod.f32")?;
+    for s in &audio {
+        out.write_all(&s.to_le_bytes())?;
+    }
+    eprintln!(
+        "wrote {} audio samples ({:.2} s @ 48 ksps)",
+        audio.len(),
+        audio.len() as f32 / 48_000.0
+    );
+
+    Ok(())
 }
