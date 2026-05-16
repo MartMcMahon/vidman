@@ -4,6 +4,7 @@ use std::{
     fs::File,
     io::{self, Write},
 };
+mod dsp;
 
 const BLOCK_SIZE: usize = 480_000;
 const BAR_WIDTH: usize = 50;
@@ -41,7 +42,7 @@ fn capture() {
             lna_db: 16,
             amp_enable: false,
             antenna_enable: false,
-            frequency_hz: 89_500_000,
+            frequency_hz: 89_700_000, // aiming for KMFA Classical station FM89.5 + 200khz
             sample_rate_hz: 2_400_000,
             sample_rate_div: 1,
         })
