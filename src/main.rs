@@ -1,8 +1,38 @@
-use std::{fs::File, io::Write, time::Instant};
-
+use clap::{Parser, Subcommand};
 use seify_hackrfone::{Config, HackRf};
+use std::{
+    fs::File,
+    io::{self, Write},
+};
+
+const BLOCK_SIZE: usize = 480_000;
+const BAR_WIDTH: usize = 50;
+const BAR_FULL_SCALE: f32 = 0.5;
+
+#[derive(Parser)]
+#[command()]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    Capture,
+    Meter,
+}
 
 fn main() {
+    let cli = Cli::parse();
+    match cli.command {
+        Commands::Capture => {
+            capture();
+        }
+        Commands::Meter => meter().expect("meter"),
+    }
+}
+
+fn capture() {
     let hackrf = HackRf::open_first().expect("opening hackrf device");
     hackrf
         .start_rx(&Config {
@@ -11,18 +41,16 @@ fn main() {
             lna_db: 16,
             amp_enable: false,
             antenna_enable: false,
-            frequency_hz: 100_900_000,
+            frequency_hz: 89_500_000,
             sample_rate_hz: 2_400_000,
             sample_rate_div: 1,
         })
         .expect("error with config}");
     let mut buf = vec![0u8; 262_144];
 
-    let mut elapsed = 0;
-    let duration = 1;
-    let start_t = Instant::now();
     let mut total_bytes_written = 0;
     let mut out_file = File::create("cap.cs8").expect("creating cap file");
+
     loop {
         let n = hackrf.read(&mut buf).expect("reading");
 
@@ -39,38 +67,82 @@ fn main() {
             break;
         }
     }
-    // hackrf.read(&mut buf).expect("error reading");
-    // let n = buf.len()
+
     hackrf.stop().expect("stopping");
 }
 
-// Roughly (from the docs.rs surface):
-// HackRf::open_first() → HackRf
-// hackrf.start_rx(&Config { vga_db, lna_db, amp_enable, antenna_enable,
-//                           frequency_hz, sample_rate_hz, sample_rate_div }) → ()
-// hackrf.read(&mut buf) → bytes_read     // buf is &mut [u8]
-// hackrf.stop_rx() → ()
-//
-// Buffer-based blocking read, not a callback model — simpler than you might be bracing for.
-//
-// M1's loop, in pseudocode (your code, not mine)
-//
-// open device
-// configure: freq = args.freq           (tune directly at the station for M1 —
-//            sample_rate_hz = 2_400_000  see note below)
-//            gains from args
-// start_rx
-// open output file
-// loop {
-//     read into a buffer (say 256 KB — that's ~50 ms at 2.4 Msps)
-//     write buffer verbatim to file
-//     if elapsed >= duration: break
-// }
-// stop_rx
-//
-// A small but useful M1 choice
-//
-// The plan calls for tuning 200 kHz above the station everywhere. For M1 specifically, I'd actually suggest you tune directly at the station. Reason: when you open the
-// resulting .cs8 in GQRX, you'll see the DC spike sitting right on top of the FM signal — that's a visceral, "oh that's what they were talking about" moment. Then M3 is
-//  the lesson where we fix it. Tuning-offset starts in M3.
-//
+fn meter() -> anyhow::Result<()> {
+    let config = Config {
+        txvga_db: 0,
+        vga_db: 8,
+        lna_db: 8,
+        amp_enable: false,
+        antenna_enable: false,
+        frequency_hz: 462_637_500,
+        // frequency_hz: 89_500_000,
+        sample_rate_hz: 2_400_000,
+        sample_rate_div: 1,
+    };
+    let hackrf = HackRf::open_first()?;
+    hackrf.start_rx(&config)?;
+
+    let mut buf = vec![0u8; 262_144];
+    let mut block = vec![0u8; BLOCK_SIZE];
+    let mut filled = 0usize;
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+
+    let mut errors = 0;
+    loop {
+        let n = match hackrf.read(&mut buf) {
+            Ok(n) => {
+                errors = 0;
+                n
+            }
+            Err(e) => {
+                eprintln!("\nread error: {e:#} — continuing");
+                if errors >= 5 {
+                    eprintln!("restarting stream");
+                    let _ = hackrf.stop(); // ignore stop error
+                    hackrf.start_rx(&config)?;
+                    errors = 0;
+                }
+                filled = 0; // discard block
+                continue;
+            }
+        };
+        let mut src = 0;
+        while src < n {
+            let take = (BLOCK_SIZE - filled).min(n - src);
+            block[filled..filled + take].copy_from_slice(&buf[src..src + take]);
+            filled += take;
+            src += take;
+            if filled == BLOCK_SIZE {
+                draw_bar(&mut out, mean_abs_z(&block));
+                filled = 0;
+            }
+        }
+    }
+}
+
+fn mean_abs_z(block: &[u8]) -> f32 {
+    let mut sum = 0.0f32;
+    for chunk in block.chunks_exact(2) {
+        let [raw_i, raw_q] = chunk else {
+            unreachable!()
+        };
+        let i = (*raw_i as i8) as f32 / 128.0;
+        let q = (*raw_q as i8) as f32 / 128.0;
+        sum += (i * i + q * q).sqrt();
+    }
+    sum / (block.len() / 2) as f32
+}
+
+fn draw_bar<W: Write>(out: &mut W, mean: f32) {
+    let filled = ((mean / BAR_FULL_SCALE) * BAR_WIDTH as f32).round() as usize;
+    let filled = filled.min(BAR_WIDTH);
+    let bar: String = "█".repeat(filled) + &" ".repeat(BAR_WIDTH - filled);
+
+    write!(out, "\r|{bar}| {mean:.4}").expect("write");
+    out.flush().expect("flush");
+}
