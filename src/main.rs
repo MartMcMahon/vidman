@@ -10,6 +10,7 @@ use crate::dsp::{
     fir::{Fir, RealFir},
 };
 mod dsp;
+mod viz;
 
 const BLOCK_SIZE: usize = 480_000;
 const BAR_WIDTH: usize = 50;
@@ -27,6 +28,8 @@ enum Commands {
     Capture,
     Meter,
     Demod,
+    #[command(alias = "viz")]
+    Visualize,
 }
 
 fn main() {
@@ -37,6 +40,7 @@ fn main() {
         }
         Commands::Meter => meter().expect("meter"),
         Commands::Demod => demod().expect("demod"),
+        Commands::Visualize => viz::run().expect("visualization"),
     }
 }
 
@@ -71,7 +75,7 @@ fn capture() {
 
         out_file.write_all(&buf[..n]).expect("writing to file");
         total_bytes_written += n;
-        if total_bytes_written >= 2_400_000 * 2 * 3 {
+        if total_bytes_written >= 2_400_000 * 2 * 20 {
             break;
         }
     }
