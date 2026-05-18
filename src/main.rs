@@ -5,6 +5,10 @@ use seify_hackrfone::{Config, HackRf};
 use std::{
     fs::File,
     io::{self, Write},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use crate::dsp::{
@@ -238,6 +242,13 @@ fn play() -> anyhow::Result<()> {
         let _ = producer.push(0.0);
     }
 
+    // ctrl-c handling
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_handler = stop.clone();
+    ctrlc::set_handler(move || {
+        stop_handler.store(true, Ordering::Relaxed);
+    })?;
+
     // start audio output
     let audio_out = audio::start(consumer)?;
     // configure hackrf
@@ -269,15 +280,18 @@ fn play() -> anyhow::Result<()> {
     let mut audio = Vec::new();
     let mut deemphed = Vec::new();
 
-    // let mut drops: u64 = 0;
-    // let mut iters: u64 = 0;
+    let mut drops: u64 = 0;
+    let mut iters: u64 = 0;
 
-    // debugging
+    let mut total_pushed = 0u64;
     // let start = std::time::Instant::now();
-    // let mut total_pushed = 0u64;
-
+    let mut total_bytes = 0u64;
     loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
         let n = hackrf.read(&mut buf)?;
+        total_bytes += n as u64;
 
         iq.clear();
         mixed.clear();
@@ -299,27 +313,35 @@ fn play() -> anyhow::Result<()> {
         fir2.process(&audio_hi, &mut audio);
         deemph.process(&audio, &mut deemphed);
 
-        // debugging
-        // for &sample in &deemphed {
-        //     if producer.push(sample).is_err() {
-        //         drops += 1;
-        //     } else {
-        //         total_pushed += 1;
-        //     }
-        // }
+        for &sample in &deemphed {
+            if producer.push(sample).is_err() {
+                drops += 1;
+            } else {
+                total_pushed += 1;
+            }
+        }
 
-        // iters += 1;
-        // if iters.is_multiple_of(20) {
-        //     let elapsed = start.elapsed().as_secs_f64();
-        //     let pops = audio_out.pops.load(std::sync::atomic::Ordering::Relaxed);
-        //     let underruns = audio_out
-        //         .underruns
-        //         .load(std::sync::atomic::Ordering::Relaxed);
-        //     eprintln!(
-        //         "push={:.0}Hz pop={:.0}Hz iters={iters} drops={drops} under={underruns}",
-        //         total_pushed as f64 / elapsed,
-        //         pops as f64 / elapsed,
-        //     );
-        // }
+        iters += 1;
+        if iters.is_multiple_of(20) {
+            // let elapsed = start.elapsed().as_secs_f64();
+            // let pops = audio_out.pops.load(std::sync::atomic::Ordering::Relaxed);
+            // let underruns = audio_out
+            //     .underruns
+            //     .load(std::sync::atomic::Ordering::Relaxed);
+            // eprintln!(
+            //     "push={:.0}Hz pop={:.0}Hz iters={iters} drops={drops} under={underruns}",
+            //     total_pushed as f64 / elapsed,
+            //     pops as f64 / elapsed,
+            // );
+            //
+            // in the periodic eprintln:
+            // eprintln!(
+            //     "hackrf rate: {:.3} Msps",
+            //     total_bytes as f64 / 2.0 / elapsed / 1e6
+            // );
+        }
     }
+    hackrf.stop()?;
+    eprintln!("\nstopped cleanly. drops={drops}");
+    Ok(())
 }

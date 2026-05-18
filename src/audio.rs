@@ -1,7 +1,4 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicI16, AtomicU64},
-};
+// use std::sync::{Arc, atomic::AtomicU64};
 
 use cpal::{
     StreamConfig,
@@ -11,8 +8,8 @@ use rtrb::Consumer;
 
 pub struct AudioOut {
     _stream: cpal::Stream,
-    pub underruns: Arc<AtomicU64>,
-    pub pops: Arc<AtomicU64>,
+    // pub underruns: Arc<AtomicU64>,
+    // pub pops: Arc<AtomicU64>,
 }
 
 pub fn start(mut consumer: Consumer<f32>) -> anyhow::Result<AudioOut> {
@@ -30,10 +27,10 @@ pub fn start(mut consumer: Consumer<f32>) -> anyhow::Result<AudioOut> {
         buffer_size: cpal::BufferSize::Default,
     };
 
-    let underruns = Arc::new(AtomicU64::new(0));
-    let underruns_cb = underruns.clone();
-    let pops = Arc::new(AtomicU64::new(0));
-    let pops_cb = pops.clone();
+    // let underruns = Arc::new(AtomicU64::new(0));
+    // let underruns_cb = underruns.clone();
+    // let pops = Arc::new(AtomicU64::new(0));
+    // let pops_cb = pops.clone();
 
     let stream = device.build_output_stream(
         &config,
@@ -44,12 +41,12 @@ pub fn start(mut consumer: Consumer<f32>) -> anyhow::Result<AudioOut> {
                     Ok(s) => {
                         frame[0] = s;
                         frame[1] = s;
-                        pops_cb.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // pops_cb.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     Err(_) => {
                         frame[0] = 0.0;
                         frame[1] = 0.0;
-                        underruns_cb.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // underruns_cb.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
             }
@@ -63,7 +60,7 @@ pub fn start(mut consumer: Consumer<f32>) -> anyhow::Result<AudioOut> {
 
     Ok(AudioOut {
         _stream: stream,
-        underruns,
-        pops,
+        // underruns,
+        // pops,
     })
 }
