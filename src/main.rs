@@ -19,6 +19,7 @@ use crate::dsp::{
 };
 mod audio;
 mod dsp;
+mod gmrs;
 mod viz;
 
 const BLOCK_SIZE: usize = 480_000;
@@ -260,7 +261,7 @@ fn play() -> anyhow::Result<()> {
         lna_db: 16,
         amp_enable: false,
         antenna_enable: false,
-        frequency_hz: KMFA + SHIFT_HZ,
+        frequency_hz: gmrs::CHANNEL_1 + SHIFT_HZ,
         sample_rate_hz: RADIO_SAMPLE_RATE_HZ,
         sample_rate_div: 1,
     })?;
