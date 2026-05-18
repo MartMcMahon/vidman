@@ -1,4 +1,6 @@
 use clap::{Parser, Subcommand};
+use num_complex::Complex32;
+use rtrb::RingBuffer;
 use seify_hackrfone::{Config, HackRf};
 use std::{
     fs::File,
@@ -6,15 +8,22 @@ use std::{
 };
 
 use crate::dsp::{
+    deemph::Deemph,
     demod::FmDemod,
     fir::{Fir, RealFir},
+    mixer::Mixer,
 };
+mod audio;
 mod dsp;
 mod viz;
 
 const BLOCK_SIZE: usize = 480_000;
 const BAR_WIDTH: usize = 50;
 const BAR_FULL_SCALE: f32 = 0.5;
+
+const KMFA: u64 = 89_500_000; // KMFA 89.5
+const SHIFT_HZ: u64 = 200_000;
+const RADIO_SAMPLE_RATE_HZ: u32 = 2_400_000;
 
 #[derive(Parser)]
 #[command()]
@@ -30,6 +39,7 @@ enum Commands {
     Demod,
     #[command(alias = "viz")]
     Visualize,
+    Play,
 }
 
 fn main() {
@@ -41,6 +51,7 @@ fn main() {
         Commands::Meter => meter().expect("meter"),
         Commands::Demod => demod().expect("demod"),
         Commands::Visualize => viz::run().expect("visualization"),
+        Commands::Play => play().expect("play"),
     }
 }
 
@@ -216,4 +227,99 @@ fn demod() -> anyhow::Result<()> {
     );
 
     Ok(())
+}
+
+fn play() -> anyhow::Result<()> {
+    // ring buffer; bridge from radio to audio
+    let (mut producer, consumer) = RingBuffer::<f32>::new(16284);
+
+    // half fill to prevent jitter
+    for _ in 0..8142 {
+        let _ = producer.push(0.0);
+    }
+
+    // start audio output
+    let audio_out = audio::start(consumer)?;
+    // configure hackrf
+    let hackrf = HackRf::open_first()?;
+
+    hackrf.start_rx(&Config {
+        txvga_db: 0,
+        vga_db: 20,
+        lna_db: 16,
+        amp_enable: false,
+        antenna_enable: false,
+        frequency_hz: KMFA + SHIFT_HZ,
+        sample_rate_hz: RADIO_SAMPLE_RATE_HZ,
+        sample_rate_div: 1,
+    })?;
+
+    // radio chain
+    let mut mixer = Mixer::new(SHIFT_HZ as f32, RADIO_SAMPLE_RATE_HZ as f32);
+    let mut fir1 = Fir::new(63, 100_000.0, 2_400_000.0, 10);
+    let mut fm = FmDemod::new();
+    let mut fir2 = RealFir::new(63, 15_000.0, 240_000.0, 5);
+    let mut deemph = Deemph::new(75e-6, 48_000.0);
+
+    let mut buf = vec![0u8; 262_144];
+    let mut iq = Vec::with_capacity(buf.len() / 2);
+    let mut mixed = Vec::with_capacity(buf.len() / 2);
+    let mut decimated = Vec::new();
+    let mut audio_hi = Vec::new();
+    let mut audio = Vec::new();
+    let mut deemphed = Vec::new();
+
+    // let mut drops: u64 = 0;
+    // let mut iters: u64 = 0;
+
+    // debugging
+    // let start = std::time::Instant::now();
+    // let mut total_pushed = 0u64;
+
+    loop {
+        let n = hackrf.read(&mut buf)?;
+
+        iq.clear();
+        mixed.clear();
+        decimated.clear();
+        audio_hi.clear();
+        audio.clear();
+        deemphed.clear();
+
+        for chunk in buf[..n].chunks_exact(2) {
+            let i = (chunk[0] as i8) as f32 / 128.0;
+            let q = (chunk[1] as i8) as f32 / 128.0;
+            iq.push(Complex32::new(i, q));
+        }
+        for &sample in &iq {
+            mixed.push(mixer.mix(sample));
+        }
+        fir1.process(&mixed, &mut decimated);
+        fm.process(&decimated, &mut audio_hi);
+        fir2.process(&audio_hi, &mut audio);
+        deemph.process(&audio, &mut deemphed);
+
+        // debugging
+        // for &sample in &deemphed {
+        //     if producer.push(sample).is_err() {
+        //         drops += 1;
+        //     } else {
+        //         total_pushed += 1;
+        //     }
+        // }
+
+        // iters += 1;
+        // if iters.is_multiple_of(20) {
+        //     let elapsed = start.elapsed().as_secs_f64();
+        //     let pops = audio_out.pops.load(std::sync::atomic::Ordering::Relaxed);
+        //     let underruns = audio_out
+        //         .underruns
+        //         .load(std::sync::atomic::Ordering::Relaxed);
+        //     eprintln!(
+        //         "push={:.0}Hz pop={:.0}Hz iters={iters} drops={drops} under={underruns}",
+        //         total_pushed as f64 / elapsed,
+        //         pops as f64 / elapsed,
+        //     );
+        // }
+    }
 }
