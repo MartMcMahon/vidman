@@ -1,13 +1,15 @@
 use clap::{Parser, Subcommand};
 use num_complex::Complex32;
+use ratatui::crossterm::Command;
 use rtrb::RingBuffer;
 use seify_hackrfone::{Config, HackRf};
 use std::{
     fs::File,
-    io::{self, Write},
+    io::{self, BufRead, Write},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
 };
 
@@ -16,6 +18,7 @@ use crate::dsp::{
     demod::FmDemod,
     fir::{Fir, RealFir},
     mixer::Mixer,
+    pipeline::Pipeline,
 };
 mod audio;
 mod dsp;
@@ -237,7 +240,6 @@ fn demod() -> anyhow::Result<()> {
 fn play() -> anyhow::Result<()> {
     // ring buffer; bridge from radio to audio
     let (mut producer, consumer) = RingBuffer::<f32>::new(16284);
-
     // half fill to prevent jitter
     for _ in 0..8142 {
         let _ = producer.push(0.0);
@@ -250,6 +252,9 @@ fn play() -> anyhow::Result<()> {
         stop_handler.store(true, Ordering::Relaxed);
     })?;
 
+    let ctrl_rx = stdin_reader_thread();
+    let mut current_freq_hz: u64 = KMFA;
+
     // start audio output
     let audio_out = audio::start(consumer)?;
     // configure hackrf
@@ -261,7 +266,7 @@ fn play() -> anyhow::Result<()> {
         lna_db: 16,
         amp_enable: false,
         antenna_enable: false,
-        frequency_hz: gmrs::CHANNEL_1 + SHIFT_HZ,
+        frequency_hz: KMFA + SHIFT_HZ,
         sample_rate_hz: RADIO_SAMPLE_RATE_HZ,
         sample_rate_div: 1,
     })?;
@@ -284,15 +289,43 @@ fn play() -> anyhow::Result<()> {
     let mut drops: u64 = 0;
     let mut iters: u64 = 0;
 
-    let mut total_pushed = 0u64;
+    // let mut total_pushed = 0u64;
     // let start = std::time::Instant::now();
-    let mut total_bytes = 0u64;
+    // let mut total_bytes = 0u64;
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
+
+        // messages?
+        let mut pipeline = Pipeline::fm();
+        while let Ok(msg) = ctrl_rx.try_recv() {
+            let new_freq = match msg {
+                ControlMsg::SetMode(new_mode) => {
+                    pipeline = match new_mode {
+                        Mode::Fm => Pipeline::fm(),
+                        Mode::Gmrs => Pipeline::gmrs(),
+                    };
+                    let mode = new_mode;
+                    current_freq_hz = default_freq_for_mode(mode);
+                    // retune(&hackrf, current_freq_hz)?;
+                    eprintln!("switched to {}", mode_name(mode));
+                    current_freq_hz
+                }
+                ControlMsg::RetuneAbs(f) => f,
+                ControlMsg::RetuneRel(d) => (current_freq_hz as i64 + d).max(1) as u64,
+            };
+            match retune(&hackrf, new_freq) {
+                Ok(()) => {
+                    current_freq_hz = new_freq;
+                    eprintln!("tuned to {:.3} Mhz", new_freq as f64 / 1e6);
+                }
+                Err(e) => eprintln!("retune error: {e}"),
+            }
+        }
+
         let n = hackrf.read(&mut buf)?;
-        total_bytes += n as u64;
+        // total_bytes += n as u64;
 
         iq.clear();
         mixed.clear();
@@ -317,32 +350,125 @@ fn play() -> anyhow::Result<()> {
         for &sample in &deemphed {
             if producer.push(sample).is_err() {
                 drops += 1;
-            } else {
-                total_pushed += 1;
-            }
+            } /*else {
+            total_pushed += 1;
+            }*/
         }
 
         iters += 1;
-        if iters.is_multiple_of(20) {
+        if iters.is_multiple_of(30) {
             // let elapsed = start.elapsed().as_secs_f64();
             // let pops = audio_out.pops.load(std::sync::atomic::Ordering::Relaxed);
-            // let underruns = audio_out
-            //     .underruns
-            //     .load(std::sync::atomic::Ordering::Relaxed);
-            // eprintln!(
-            //     "push={:.0}Hz pop={:.0}Hz iters={iters} drops={drops} under={underruns}",
-            //     total_pushed as f64 / elapsed,
-            //     pops as f64 / elapsed,
-            // );
-            //
-            // in the periodic eprintln:
-            // eprintln!(
-            //     "hackrf rate: {:.3} Msps",
-            //     total_bytes as f64 / 2.0 / elapsed / 1e6
-            // );
+            let fill = producer.buffer().capacity() - producer.slots();
+            let underruns = audio_out
+                .underruns
+                .load(std::sync::atomic::Ordering::Relaxed);
+            eprintln!("iters={iters} drops={drops} under={underruns} fill={fill}",);
         }
     }
     hackrf.stop()?;
     eprintln!("\nstopped cleanly. drops={drops}");
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ControlMsg {
+    RetuneAbs(u64),
+    RetuneRel(i64),
+    SetMode(Mode),
+}
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Mode {
+    Fm,
+    Gmrs,
+}
+
+fn parse_control_msg(line: &str) -> Option<ControlMsg> {
+    let s = line.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if s == "+" {
+        return Some(ControlMsg::RetuneRel(200_000));
+    } else if s == "-" {
+        return Some(ControlMsg::RetuneRel(-200_000));
+    }
+
+    if let Some(rest) = s.strip_prefix("mode ") {
+        return match rest.trim() {
+            "fm" => Some(ControlMsg::SetMode(Mode::Fm)),
+            "gmrs" => Some(ControlMsg::SetMode(Mode::Gmrs)),
+            _ => None,
+        };
+    }
+
+    let (num_str, is_mhz_marker) = if let Some(stripped) = s.strip_suffix(['M', 'm']) {
+        (stripped, true)
+    } else {
+        (s, false)
+    };
+
+    let n: f64 = num_str.parse().ok()?;
+    let frequency_hz = if is_mhz_marker || n < 1000.0 {
+        (n * 1_000_000.0) as u64
+    } else {
+        n as u64
+    };
+    Some(ControlMsg::RetuneAbs(frequency_hz))
+}
+
+fn stdin_reader_thread() -> mpsc::Receiver<ControlMsg> {
+    let (tx, rx) = mpsc::channel::<ControlMsg>();
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            print!("play> ");
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+            if stdin.lock().read_line(&mut buf).unwrap_or(0) == 0 {
+                break;
+            }
+            match parse_control_msg(&buf) {
+                Some(msg) => {
+                    if tx.send(msg).is_err() {
+                        break;
+                    }
+                }
+                None => {
+                    if !buf.trim().is_empty() {
+                        eprintln!("? unrecognized: {}", buf.trim());
+                    }
+                }
+            }
+        }
+    });
+    rx
+}
+
+fn retune(hackrf: &HackRf, target_rf_hz: u64) -> anyhow::Result<()> {
+    let tuned_to = target_rf_hz + 200_000;
+    hackrf.set_freq(tuned_to)?;
+    Ok(())
+}
+
+fn default_freq_for_mode(mode: Mode) -> u64 {
+    match mode {
+        Mode::Fm => 89_500_000,
+        Mode::Gmrs => gmrs::CHANNEL_1,
+    }
+}
+
+fn step_for_mode(mode: Mode) -> i32 {
+    match mode {
+        Mode::Fm => 200_00,
+        Mode::Gmrs => 12_500,
+    }
+}
+
+fn mode_name(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Fm => "FM",
+        Mode::Gmrs => "GMRS",
+    }
 }
