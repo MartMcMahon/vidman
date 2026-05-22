@@ -1,13 +1,12 @@
 // Finite Impulse Resposne filter
 
-use std::collections::VecDeque;
 use std::f32::consts::PI;
 
 use num_complex::Complex32;
 
 pub struct Fir {
     taps: Vec<f32>,
-    history: VecDeque<Complex32>,
+    history: Vec<Complex32>, // carried tail: last num_taps-1 samples of prev block
     decimation_factor: usize,
     sample_count: usize,
 }
@@ -20,7 +19,7 @@ impl Fir {
         decimation_factor: usize,
     ) -> Self {
         let taps = windowed_sinc(num_taps, cutoff_hz, sample_rate_hz);
-        let history = VecDeque::from(vec![Complex32::new(0.0, 0.0); num_taps]);
+        let history = vec![Complex32::new(0.0, 0.0); num_taps - 1];
         Self {
             taps,
             history,
@@ -30,18 +29,32 @@ impl Fir {
     }
 
     pub fn process(&mut self, input: &[Complex32], output: &mut Vec<Complex32>) {
-        for &x in input {
-            self.history.pop_front();
-            self.history.push_back(x);
-            self.sample_count += 1;
-            if self.sample_count.is_multiple_of(self.decimation_factor) {
-                let mut acc = Complex32::new(0.0, 0.0);
-                for (k, &h) in self.taps.iter().enumerate() {
-                    acc += self.history[k] * h;
-                }
-                output.push(acc);
+        let n = self.taps.len();
+        let decim = self.decimation_factor;
+
+        // first block-local index that lands on the decimation phase
+        let r = (self.sample_count + 1) % decim;
+        let j0 = (decim - r) % decim;
+
+        // history becomes: carried tail (n-1 samples) ++ this input block
+        self.history.extend_from_slice(input);
+
+        let mut j = j0;
+        while j < input.len() {
+            // n-sample window ending at block sample j; contiguous → vectorizes
+            let w = &self.history[j..j + n];
+            let mut acc = Complex32::new(0.0, 0.0);
+            for (&x, &t) in w.iter().zip(&self.taps) {
+                acc += x * t;
             }
+            output.push(acc);
+            j += decim;
         }
+
+        self.sample_count += input.len();
+        // keep only the n-1 samples needed to start the next block
+        let drop = self.history.len() - (n - 1);
+        self.history.drain(..drop);
     }
 }
 
@@ -74,7 +87,7 @@ fn windowed_sinc(n: usize, cutoff_hz: f32, fs: f32) -> Vec<f32> {
 
 pub struct RealFir {
     taps: Vec<f32>,
-    history: VecDeque<f32>,
+    history: Vec<f32>, // carried tail: last num_taps-1 samples of prev block
     decimation_factor: usize,
     sample_count: usize,
 }
@@ -87,7 +100,7 @@ impl RealFir {
         decimation_factor: usize,
     ) -> Self {
         let taps = windowed_sinc(num_taps, cutoff_hz, sample_rate_hz);
-        let history = VecDeque::from(vec![0.0f32; num_taps]);
+        let history = vec![0.0f32; num_taps - 1];
         Self {
             taps,
             history,
@@ -97,17 +110,27 @@ impl RealFir {
     }
 
     pub fn process(&mut self, input: &[f32], output: &mut Vec<f32>) {
-        for &x in input {
-            self.history.pop_front();
-            self.history.push_back(x);
-            self.sample_count += 1;
-            if self.sample_count.is_multiple_of(self.decimation_factor) {
-                let mut acc = 0.0f32;
-                for (k, &h) in self.taps.iter().enumerate() {
-                    acc += self.history[k] * h;
-                }
-                output.push(acc);
+        let n = self.taps.len();
+        let decim = self.decimation_factor;
+
+        let r = (self.sample_count + 1) % decim;
+        let j0 = (decim - r) % decim;
+
+        self.history.extend_from_slice(input);
+
+        let mut j = j0;
+        while j < input.len() {
+            let w = &self.history[j..j + n];
+            let mut acc = 0.0f32;
+            for (&x, &t) in w.iter().zip(&self.taps) {
+                acc += x * t;
             }
+            output.push(acc);
+            j += decim;
         }
+
+        self.sample_count += input.len();
+        let drop = self.history.len() - (n - 1);
+        self.history.drain(..drop);
     }
 }

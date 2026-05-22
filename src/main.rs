@@ -272,18 +272,18 @@ fn play() -> anyhow::Result<()> {
     })?;
 
     // radio chain
-    let mut mixer = Mixer::new(SHIFT_HZ as f32, RADIO_SAMPLE_RATE_HZ as f32);
-    let mut fir1 = Fir::new(63, 100_000.0, 2_400_000.0, 10);
-    let mut fm = FmDemod::new();
-    let mut fir2 = RealFir::new(63, 15_000.0, 240_000.0, 5);
-    let mut deemph = Deemph::new(75e-6, 48_000.0);
+    // let mut mixer = Mixer::new(SHIFT_HZ as f32, RADIO_SAMPLE_RATE_HZ as f32);
+    // let mut fir1 = Fir::new(63, 100_000.0, 2_400_000.0, 10);
+    // let mut fm = FmDemod::new();
+    // let mut fir2 = RealFir::new(63, 15_000.0, 240_000.0, 5);
+    // let mut deemph = Deemph::new(75e-6, 48_000.0);
 
     let mut buf = vec![0u8; 262_144];
     let mut iq = Vec::with_capacity(buf.len() / 2);
     let mut mixed = Vec::with_capacity(buf.len() / 2);
     let mut decimated = Vec::new();
     let mut audio_hi = Vec::new();
-    let mut audio = Vec::new();
+    let mut audio: Vec<f32> = Vec::new();
     let mut deemphed = Vec::new();
 
     let mut drops: u64 = 0;
@@ -339,13 +339,18 @@ fn play() -> anyhow::Result<()> {
             let q = (chunk[1] as i8) as f32 / 128.0;
             iq.push(Complex32::new(i, q));
         }
-        for &sample in &iq {
-            mixed.push(mixer.mix(sample));
-        }
-        fir1.process(&mixed, &mut decimated);
-        fm.process(&decimated, &mut audio_hi);
-        fir2.process(&audio_hi, &mut audio);
-        deemph.process(&audio, &mut deemphed);
+
+        pipeline.process(
+            &iq,
+            &mut mixed,
+            &mut decimated,
+            &mut audio_hi,
+            &mut deemphed,
+        );
+        // fir1.process(&mixed, &mut decimated);
+        // fm.process(&decimated, &mut audio_hi);
+        // fir2.process(&audio_hi, &mut audio);
+        // deemph.process(&audio, &mut deemphed);
 
         for &sample in &deemphed {
             if producer.push(sample).is_err() {
