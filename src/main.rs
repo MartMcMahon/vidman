@@ -364,11 +364,11 @@ fn play() -> anyhow::Result<()> {
         if iters.is_multiple_of(30) {
             // let elapsed = start.elapsed().as_secs_f64();
             // let pops = audio_out.pops.load(std::sync::atomic::Ordering::Relaxed);
-            let fill = producer.buffer().capacity() - producer.slots();
-            let underruns = audio_out
-                .underruns
-                .load(std::sync::atomic::Ordering::Relaxed);
-            eprintln!("iters={iters} drops={drops} under={underruns} fill={fill}",);
+            // let fill = producer.buffer().capacity() - producer.slots();
+            // let underruns = audio_out
+            //     .underruns
+            //     .load(std::sync::atomic::Ordering::Relaxed);
+            // eprintln!("iters={iters} drops={drops} under={underruns} fill={fill}",);
         }
     }
     hackrf.stop()?;
@@ -466,7 +466,7 @@ fn default_freq_for_mode(mode: Mode) -> u64 {
 
 fn step_for_mode(mode: Mode) -> i32 {
     match mode {
-        Mode::Fm => 200_00,
+        Mode::Fm => 200_000,
         Mode::Gmrs => 12_500,
     }
 }
