@@ -24,6 +24,7 @@ mod audio;
 mod dsp;
 mod gmrs;
 mod viz;
+mod waterfall;
 
 const BLOCK_SIZE: usize = 480_000;
 const BAR_WIDTH: usize = 50;
@@ -48,6 +49,8 @@ enum Commands {
     #[command(alias = "viz")]
     Visualize,
     Play,
+    #[command(alias = "wf")]
+    Waterfall,
 }
 
 fn main() {
@@ -60,6 +63,7 @@ fn main() {
         Commands::Demod => demod().expect("demod"),
         Commands::Visualize => viz::run().expect("visualization"),
         Commands::Play => play().expect("play"),
+        Commands::Waterfall => waterfall::run(gmrs::CHANNEL_1).expect("waterfall"),
     }
 }
 
