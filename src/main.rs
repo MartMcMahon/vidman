@@ -63,7 +63,7 @@ fn main() {
         Commands::Demod => demod().expect("demod"),
         Commands::Visualize => viz::run().expect("visualization"),
         Commands::Play => play().expect("play"),
-        Commands::Waterfall => waterfall::run(gmrs::CHANNEL_1).expect("waterfall"),
+        Commands::Waterfall => waterfall::run(KMFA).expect("waterfall"),
     }
 }
 

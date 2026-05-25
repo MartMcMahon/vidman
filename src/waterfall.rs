@@ -3,7 +3,7 @@ use seify_hackrfone::{Config, HackRf};
 use std::sync::{
     Arc,
     atomic::AtomicBool,
-    mpsc::{Receiver, Sender},
+    mpsc::{Receiver, SyncSender},
 };
 use winit::{
     application::ApplicationHandler,
@@ -70,10 +70,7 @@ impl ApplicationHandler for App {
             }
             // WindowEvent::Resized(s) => gfx.resize(s.width, s.height),
             WindowEvent::RedrawRequested => {
-                while let Ok(row) = self.rx.try_recv() {
-                    gfx.push_row(&row);
-                }
-                if let Err(e) = gfx.render() {
+                if let Err(e) = gfx.render(&self.rx) {
                     eprintln!("render error: {e:#}");
                 }
                 window.request_redraw();
@@ -85,7 +82,9 @@ impl ApplicationHandler for App {
 
 pub fn run(freq_hz: u64) -> anyhow::Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
-    let (tx, rx) = std::sync::mpsc::channel::<Vec<f32>>();
+    // bounded so the radio thread parks instead of piling rows up
+    // while the window is hidden / not being drained
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(8);
     spawn_radio(freq_hz, tx, stop.clone());
 
     let event_loop = EventLoop::new()?;
@@ -295,7 +294,29 @@ impl Gfx {
         }
     }
 
-    fn render(&mut self) -> anyhow::Result<()> {
+    fn render(&mut self, rx: &Receiver<Vec<f32>>) -> anyhow::Result<()> {
+        if self.config.width == 0 || self.config.height == 0 {
+            return Ok(());
+        }
+
+        // acquire the swapchain image BEFORE any queue.write_*; if we can't
+        // present (window hidden/occluded/etc) we must not allocate staging
+        // memory we won't submit
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(f)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            wgpu::CurrentSurfaceTexture::Timeout => return Ok(()),
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                self.surface.configure(&self.device, &self.config);
+                return Ok(());
+            }
+            other => anyhow::bail!("surface acquire failed: {other:?}"),
+        };
+
+        // safe to allocate staging now — we'll submit below
+        while let Ok(row) = rx.try_recv() {
+            self.push_row(&row);
+        }
         self.queue.write_buffer(
             &self.params_buf,
             0,
@@ -306,12 +327,6 @@ impl Gfx {
                 db_max: DB_MAX,
             }),
         );
-
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
-            other => anyhow::bail!("surface acquire failed: {other:?}"),
-        };
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -345,7 +360,7 @@ impl Gfx {
     }
 }
 
-fn spawn_radio(freq_hz: u64, tx: Sender<Vec<f32>>, stop: Arc<AtomicBool>) {
+fn spawn_radio(freq_hz: u64, tx: SyncSender<Vec<f32>>, stop: Arc<AtomicBool>) {
     std::thread::spawn(move || {
         let hackrf = HackRf::open_first().expect("open hackrf");
         hackrf
