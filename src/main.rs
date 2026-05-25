@@ -381,18 +381,18 @@ fn play() -> anyhow::Result<()> {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum ControlMsg {
+pub(crate) enum ControlMsg {
     RetuneAbs(u64),
     RetuneRel(i64),
     SetMode(Mode),
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Mode {
+pub(crate) enum Mode {
     Fm,
     Gmrs,
 }
 
-fn parse_control_msg(line: &str) -> Option<ControlMsg> {
+pub(crate) fn parse_control_msg(line: &str) -> Option<ControlMsg> {
     let s = line.trim();
     if s.is_empty() {
         return None;
@@ -428,12 +428,17 @@ fn parse_control_msg(line: &str) -> Option<ControlMsg> {
 
 fn stdin_reader_thread() -> mpsc::Receiver<ControlMsg> {
     let (tx, rx) = mpsc::channel::<ControlMsg>();
+    spawn_stdin_reader(tx, "play");
+    rx
+}
+
+pub(crate) fn spawn_stdin_reader(tx: mpsc::Sender<ControlMsg>, prompt: &'static str) {
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
         let mut buf = String::new();
         loop {
             buf.clear();
-            print!("play> ");
+            print!("{prompt}> ");
             std::io::Write::flush(&mut std::io::stdout()).ok();
             if stdin.lock().read_line(&mut buf).unwrap_or(0) == 0 {
                 break;
@@ -452,16 +457,15 @@ fn stdin_reader_thread() -> mpsc::Receiver<ControlMsg> {
             }
         }
     });
-    rx
 }
 
-fn retune(hackrf: &HackRf, target_rf_hz: u64) -> anyhow::Result<()> {
+pub(crate) fn retune(hackrf: &HackRf, target_rf_hz: u64) -> anyhow::Result<()> {
     let tuned_to = target_rf_hz + 200_000;
     hackrf.set_freq(tuned_to)?;
     Ok(())
 }
 
-fn default_freq_for_mode(mode: Mode) -> u64 {
+pub(crate) fn default_freq_for_mode(mode: Mode) -> u64 {
     match mode {
         Mode::Fm => 89_500_000,
         Mode::Gmrs => gmrs::CHANNEL_1,
@@ -475,7 +479,7 @@ fn step_for_mode(mode: Mode) -> i32 {
     }
 }
 
-fn mode_name(mode: Mode) -> &'static str {
+pub(crate) fn mode_name(mode: Mode) -> &'static str {
     match mode {
         Mode::Fm => "FM",
         Mode::Gmrs => "GMRS",

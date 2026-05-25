@@ -2,7 +2,8 @@ struct Params {
   write_row: u32,
   history  : u32,
   db_min   : f32,
-  db_max   : f32
+  db_max   : f32,
+  tuned_x  : f32,
 }
 
 @group(0) @binding(0) var waterfall: texture_2d<f32>;
@@ -47,5 +48,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
   let row = (i32(params.write_row) - 1 - age + 2 * hist) % hist;
   let db = textureLoad(waterfall, vec2<i32>(col, row), 0).r;
   let t = clamp((db - params.db_min) / (params.db_max - params.db_min), 0.0, 1.0);
-  return vec4<f32>(colormap(t), 1.0);
+  let base = colormap(t);
+
+  // thin vertical line at the tuned-to frequency
+  let line_half_width = 0.5 / f32(dims.x); // ~1 texel wide
+  let marker = step(abs(in.uv.x - params.tuned_x), line_half_width);
+  let color = mix(base, vec3<f32>(1.0, 1.0, 1.0), marker);
+  return vec4<f32>(color, 1.0);
 }

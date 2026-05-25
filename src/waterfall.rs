@@ -1,9 +1,10 @@
 use num_complex::Complex32;
+use rtrb::{Producer, RingBuffer};
 use seify_hackrfone::{Config, HackRf};
 use std::sync::{
     Arc,
     atomic::AtomicBool,
-    mpsc::{Receiver, SyncSender},
+    mpsc::{self, Receiver, Sender, SyncSender},
 };
 use winit::{
     application::ApplicationHandler,
@@ -13,7 +14,13 @@ use winit::{
     window::{Window, WindowId},
 };
 
-use crate::{RADIO_SAMPLE_RATE_HZ, SHIFT_HZ, dsp::fft::Spectrum};
+use crate::{
+    ControlMsg, Mode, RADIO_SAMPLE_RATE_HZ, SHIFT_HZ, audio, default_freq_for_mode,
+    dsp::{fft::Spectrum, pipeline::Pipeline},
+    mode_name, retune, spawn_stdin_reader,
+};
+
+const TUNE_STEP_HZ: i64 = 200_000;
 
 const FFT_SIZE: usize = 1024; // FFT bins == waterfall texture width
 const HISTORY: u32 = 512; // texture height: rows of history kept
@@ -28,12 +35,16 @@ struct Params {
     history: u32,
     db_min: f32,
     db_max: f32,
+    // normalized x position of the actual tuned-to signal after fftshift;
+    // we LO-tune SHIFT_HZ above the station, so the signal sits to the left
+    tuned_x: f32,
 }
 
 struct App {
     window: Option<Arc<Window>>,
     gfx: Option<Gfx>,
     rx: Receiver<Vec<f32>>,
+    ctrl_tx: Sender<ControlMsg>,
     stop: Arc<AtomicBool>,
 }
 
@@ -68,6 +79,28 @@ impl ApplicationHandler for App {
                 self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
                 event_loop.exit();
             }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Named(NamedKey::ArrowUp),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } => {
+                let _ = self.ctrl_tx.send(ControlMsg::RetuneRel(TUNE_STEP_HZ));
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Named(NamedKey::ArrowDown),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } => {
+                let _ = self.ctrl_tx.send(ControlMsg::RetuneRel(-TUNE_STEP_HZ));
+            }
             // WindowEvent::Resized(s) => gfx.resize(s.width, s.height),
             WindowEvent::RedrawRequested => {
                 if let Err(e) = gfx.render(&self.rx) {
@@ -85,13 +118,27 @@ pub fn run(freq_hz: u64) -> anyhow::Result<()> {
     // bounded so the radio thread parks instead of piling rows up
     // while the window is hidden / not being drained
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(8);
-    spawn_radio(freq_hz, tx, stop.clone());
+
+    // audio ring buffer; producer feeds the radio thread, consumer feeds cpal
+    let (mut producer, consumer) = RingBuffer::<f32>::new(16_284);
+    for _ in 0..8_142 {
+        let _ = producer.push(0.0);
+    }
+    // keep `_audio_out` alive for the duration of `run`: dropping it stops the stream
+    let _audio_out = audio::start(consumer)?;
+
+    // control channel: both stdin and winit key handler feed the radio thread
+    let (ctrl_tx, ctrl_rx) = mpsc::channel::<ControlMsg>();
+    spawn_stdin_reader(ctrl_tx.clone(), "wf");
+
+    spawn_radio(freq_hz, tx, ctrl_rx, producer, stop.clone());
 
     let event_loop = EventLoop::new()?;
     let mut app = App {
         window: None,
         gfx: None,
         rx,
+        ctrl_tx,
         stop,
     };
     event_loop.run_app(&mut app)?;
@@ -325,6 +372,7 @@ impl Gfx {
                 history: HISTORY,
                 db_min: DB_MIN,
                 db_max: DB_MAX,
+                tuned_x: 0.5 - (SHIFT_HZ as f32) / (RADIO_SAMPLE_RATE_HZ as f32),
             }),
         );
         let view = frame
@@ -360,7 +408,13 @@ impl Gfx {
     }
 }
 
-fn spawn_radio(freq_hz: u64, tx: SyncSender<Vec<f32>>, stop: Arc<AtomicBool>) {
+fn spawn_radio(
+    freq_hz: u64,
+    tx: SyncSender<Vec<f32>>,
+    ctrl_rx: Receiver<ControlMsg>,
+    mut producer: Producer<f32>,
+    stop: Arc<AtomicBool>,
+) {
     std::thread::spawn(move || {
         let hackrf = HackRf::open_first().expect("open hackrf");
         hackrf
@@ -376,12 +430,42 @@ fn spawn_radio(freq_hz: u64, tx: SyncSender<Vec<f32>>, stop: Arc<AtomicBool>) {
             })
             .expect("start_rx");
 
+        let mut current_freq_hz = freq_hz;
+        let mut pipeline = Pipeline::fm();
+
         let mut spec = Spectrum::new(FFT_SIZE);
         let mut buf = vec![0u8; 262_144];
-        let mut chunk = vec![Complex32::new(0.0, 0.0); FFT_SIZE];
+        let mut iq: Vec<Complex32> = Vec::with_capacity(buf.len() / 2);
+        let mut mixed = Vec::with_capacity(buf.len() / 2);
+        let mut decimated = Vec::new();
+        let mut audio_hi = Vec::new();
+        let mut deemphed = Vec::new();
         let mut pushed = 0usize;
 
         while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            // drain control messages (typed stdin lines or window arrow keys)
+            while let Ok(msg) = ctrl_rx.try_recv() {
+                let new_freq = match msg {
+                    ControlMsg::SetMode(new_mode) => {
+                        pipeline = match new_mode {
+                            Mode::Fm => Pipeline::fm(),
+                            Mode::Gmrs => Pipeline::gmrs(),
+                        };
+                        eprintln!("switched to {}", mode_name(new_mode));
+                        default_freq_for_mode(new_mode)
+                    }
+                    ControlMsg::RetuneAbs(f) => f,
+                    ControlMsg::RetuneRel(d) => (current_freq_hz as i64 + d).max(1) as u64,
+                };
+                match retune(&hackrf, new_freq) {
+                    Ok(()) => {
+                        current_freq_hz = new_freq;
+                        eprintln!("tuned to {:.3} MHz", new_freq as f64 / 1e6);
+                    }
+                    Err(e) => eprintln!("retune error: {e}"),
+                }
+            }
+
             let n = match hackrf.read(&mut buf) {
                 Ok(n) => n,
                 Err(e) => {
@@ -390,21 +474,35 @@ fn spawn_radio(freq_hz: u64, tx: SyncSender<Vec<f32>>, stop: Arc<AtomicBool>) {
                 }
             };
 
-            let samples = n / 2;
+            iq.clear();
+            for chunk in buf[..n].chunks_exact(2) {
+                let i = (chunk[0] as i8) as f32 / 128.0;
+                let q = (chunk[1] as i8) as f32 / 128.0;
+                iq.push(Complex32::new(i, q));
+            }
+
+            // audio path: demod -> deemph -> ring buffer
+            mixed.clear();
+            decimated.clear();
+            audio_hi.clear();
+            deemphed.clear();
+            pipeline.process(&iq, &mut mixed, &mut decimated, &mut audio_hi, &mut deemphed);
+            for &s in &deemphed {
+                let _ = producer.push(s); // drop on overflow; consumer is real-time
+            }
+
+            // viz path: feed FFT in FFT_SIZE chunks; average AVG_FFTS into one row
             let mut s = 0;
-            while s + FFT_SIZE <= samples {
-                for k in 0..FFT_SIZE {
-                    let re = (buf[2 * (s + k)] as i8) as f32 / 128.0;
-                    let im = (buf[2 * (s + k) + 1] as i8) as f32 / 128.0;
-                    chunk[k] = Complex32::new(re, im);
-                }
-                spec.push(&chunk);
+            while s + FFT_SIZE <= iq.len() {
+                spec.push(&iq[s..s + FFT_SIZE]);
                 pushed += 1;
                 s += FFT_SIZE;
 
                 if pushed == AVG_FFTS {
                     // take(): db spectrum averaged over avg_ffts, fftshifted.
-                    if tx.send(spec.take()).is_err() {
+                    let mut row = spec.take();
+                    notch_dc(&mut row);
+                    if tx.send(row).is_err() {
                         let _ = hackrf.stop(); // receiver gone — window closed
                         return;
                     }
@@ -414,4 +512,18 @@ fn spawn_radio(freq_hz: u64, tx: SyncSender<Vec<f32>>, stop: Arc<AtomicBool>) {
         }
         let _ = hackrf.stop();
     });
+}
+
+// LO leakage paints a bright stripe at the center bin. Replace the center
+// three bins with the average of their outer neighbors so it stops dominating
+// the colormap. Audio path doesn't see this — it tunes SHIFT_HZ off DC.
+fn notch_dc(row: &mut [f32]) {
+    let mid = row.len() / 2;
+    if mid < 2 || mid + 2 >= row.len() {
+        return;
+    }
+    let avg = 0.5 * (row[mid - 2] + row[mid + 2]);
+    row[mid - 1] = avg;
+    row[mid] = avg;
+    row[mid + 1] = avg;
 }
