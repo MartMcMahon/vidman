@@ -1,14 +1,12 @@
-use std::f32::consts::FRAC_PI_4;
-
 /// Maps station frequencies to hallway-meter positions, computes per-station
 /// (gain, pan) given a listener position, and produces interleaved stereo.
 pub struct SpatialMixer {
-    pub camera_x: f32,      // listener position in hallway meters
-    pub hz_per_meter: f32,  // freq <-> world conversion (e.g. 50_000)
-    pub center_hz: f64,     // freq at hallway x = 0
-    pub pan_full_m: f32,    // distance at which pan saturates to ±1 (e.g. 5.0)
-    pub dist_k: f32,        // distance falloff constant in 1/(1+k·d²) (e.g. 0.25)
-    pub dist_floor_m: f32,  // minimum distance to avoid 0-div blasts (e.g. 0.5)
+    pub camera_x: f32,     // listener position in hallway meters
+    pub hz_per_meter: f32, // freq <-> world conversion (e.g. 50_000)
+    pub center_hz: f64,    // freq at hallway x = 0
+    pub pan_full_m: f32,   // distance at which pan saturates to ±1 (e.g. 5.0)
+    pub dist_k: f32,       // distance falloff constant in 1/(1+k·d²) (e.g. 0.25)
+    pub dist_floor_m: f32, // minimum distance to avoid 0-div blasts (e.g. 0.5)
 }
 
 impl SpatialMixer {

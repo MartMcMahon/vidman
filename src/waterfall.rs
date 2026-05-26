@@ -15,9 +15,10 @@ use winit::{
 };
 
 use crate::{
-    ControlMsg, Mode, RADIO_SAMPLE_RATE_HZ, SHIFT_HZ, audio, default_freq_for_mode,
+    audio,
+    control::{ControlMsg, Mode, default_freq_for_mode, mode_name, spawn_stdin_reader},
     dsp::{fft::Spectrum, pipeline::Pipeline},
-    mode_name, retune, spawn_stdin_reader,
+    radio::{RADIO_SAMPLE_RATE_HZ, SHIFT_HZ, retune},
 };
 
 const TUNE_STEP_HZ: i64 = 200_000;

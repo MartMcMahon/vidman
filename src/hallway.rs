@@ -17,9 +17,10 @@ use winit::{
 };
 
 use crate::{
-    ControlMsg, RADIO_SAMPLE_RATE_HZ, SHIFT_HZ, audio,
+    audio,
+    control::{ControlMsg, spawn_stdin_reader},
     dsp::{fft::Spectrum, pipeline::Pipeline},
-    spawn_stdin_reader,
+    radio::{RADIO_SAMPLE_RATE_HZ, SHIFT_HZ},
 };
 
 const FFT_SIZE: usize = 1024;

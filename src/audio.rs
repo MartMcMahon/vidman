@@ -8,8 +8,6 @@ use rtrb::Consumer;
 
 pub struct AudioOut {
     _stream: cpal::Stream,
-    pub underruns: Arc<AtomicU64>,
-    // pub pops: Arc<AtomicU64>,
 }
 
 pub fn start(mut consumer: Consumer<f32>) -> anyhow::Result<AudioOut> {
@@ -59,11 +57,7 @@ pub fn start(mut consumer: Consumer<f32>) -> anyhow::Result<AudioOut> {
 
     stream.play()?;
 
-    Ok(AudioOut {
-        _stream: stream,
-        underruns,
-        // pops,
-    })
+    Ok(AudioOut { _stream: stream })
 }
 
 /// Sibling of `start()` for already-interleaved stereo data: pulls one f32
@@ -101,8 +95,5 @@ pub fn start_stereo(mut consumer: Consumer<f32>) -> anyhow::Result<AudioOut> {
     )?;
 
     stream.play()?;
-    Ok(AudioOut {
-        _stream: stream,
-        underruns,
-    })
+    Ok(AudioOut { _stream: stream })
 }
