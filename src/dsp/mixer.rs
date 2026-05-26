@@ -16,6 +16,13 @@ impl Mixer {
         }
     }
 
+    /// Change the tuning offset without resetting phase. Phase-continuous
+    /// retunes are silent; the alternative (rebuilding the mixer) causes a
+    /// click at the transition because phase jumps to 0.
+    pub fn retune(&mut self, shift_hz: f32, sample_rate_hz: f32) {
+        self.phase_inc = 2.0 * PI * shift_hz / sample_rate_hz;
+    }
+
     pub fn mix(&mut self, sample: Complex32) -> Complex32 {
         let (sin, cos) = self.phase.sin_cos();
         let lo = Complex32::new(cos, sin);

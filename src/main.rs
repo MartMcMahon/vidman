@@ -16,13 +16,18 @@ use std::{
 use crate::dsp::{
     deemph::Deemph,
     demod::FmDemod,
+    fft::Spectrum,
     fir::{Fir, RealFir},
+    fleet::Fleet,
     mixer::Mixer,
+    peaks::{Event, Params as PeakParams, PeakDetector},
     pipeline::Pipeline,
+    spatial::SpatialMixer,
 };
 mod audio;
 mod dsp;
 mod gmrs;
+mod hallway;
 mod viz;
 mod waterfall;
 
@@ -51,6 +56,37 @@ enum Commands {
     Play,
     #[command(alias = "wf")]
     Waterfall,
+    /// Detect transmissions in the captured band and emit NDJSON events on stdout.
+    Scan {
+        /// Center frequency in Hz (suffix M = MHz, K = kHz)
+        #[arg(long, default_value = "100M")]
+        freq: String,
+        /// Narrowband mode (smaller min-separation, suited to GMRS-style channels)
+        #[arg(long)]
+        narrow: bool,
+    },
+    /// Run K parallel FM demod chains tracking the K strongest stations, mono mix.
+    Fleet {
+        #[arg(long, default_value = "100M")]
+        freq: String,
+        #[arg(long, default_value_t = 4)]
+        k: usize,
+    },
+    /// Fleet + spatial stereo pan. Camera auto-walks back and forth through the band.
+    Spatial {
+        #[arg(long, default_value = "100M")]
+        freq: String,
+        #[arg(long, default_value_t = 4)]
+        k: usize,
+        /// Camera walking speed in m/s
+        #[arg(long, default_value_t = 2.0)]
+        speed: f32,
+    },
+    /// 3D hallway scene: WASD to walk, A/D to turn, spectrum on walls, single-station audio.
+    Hallway {
+        #[arg(long, default_value = "89.5M")]
+        freq: String,
+    },
 }
 
 fn main() {
@@ -64,7 +100,443 @@ fn main() {
         Commands::Visualize => viz::run().expect("visualization"),
         Commands::Play => play().expect("play"),
         Commands::Waterfall => waterfall::run(KMFA).expect("waterfall"),
+        Commands::Scan { freq, narrow } => scan(parse_freq(&freq), narrow).expect("scan"),
+        Commands::Fleet { freq, k } => fleet(parse_freq(&freq), k).expect("fleet"),
+        Commands::Spatial { freq, k, speed } => {
+            spatial(parse_freq(&freq), k, speed).expect("spatial")
+        }
+        Commands::Hallway { freq } => hallway::run(parse_freq(&freq)).expect("hallway"),
     }
+}
+
+fn parse_freq(s: &str) -> u64 {
+    let s = s.trim();
+    let (num, mult) = if let Some(rest) = s.strip_suffix(['M', 'm']) {
+        (rest, 1_000_000.0)
+    } else if let Some(rest) = s.strip_suffix(['K', 'k']) {
+        (rest, 1_000.0)
+    } else {
+        (s, 1.0)
+    };
+    let n: f64 = num.parse().expect("freq is a number");
+    (n * mult) as u64
+}
+
+fn scan(freq_hz: u64, narrow: bool) -> anyhow::Result<()> {
+    const FFT_SIZE: usize = 1024;
+    const AVG_FFTS: usize = 64;
+    const ROWS_PER_SECOND: f32 =
+        RADIO_SAMPLE_RATE_HZ as f32 / (FFT_SIZE as f32 * AVG_FFTS as f32);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_handler = stop.clone();
+    ctrlc::set_handler(move || {
+        stop_handler.store(true, Ordering::Relaxed);
+    })?;
+
+    let hackrf = HackRf::open_first()?;
+    let tuned_to = freq_hz + SHIFT_HZ;
+    hackrf.start_rx(&Config {
+        txvga_db: 0,
+        vga_db: 16,
+        lna_db: 16,
+        amp_enable: false,
+        antenna_enable: false,
+        frequency_hz: tuned_to,
+        sample_rate_hz: RADIO_SAMPLE_RATE_HZ,
+        sample_rate_div: 1,
+    })?;
+    eprintln!(
+        "scan: tuned to {:.3} MHz (center {:.3} MHz + {} kHz LO offset), {} rows/s",
+        tuned_to as f64 / 1e6,
+        freq_hz as f64 / 1e6,
+        SHIFT_HZ / 1000,
+        ROWS_PER_SECOND,
+    );
+
+    let mut detector = PeakDetector::new(PeakParams {
+        sample_rate_hz: RADIO_SAMPLE_RATE_HZ as f32,
+        fft_size: FFT_SIZE,
+        open_threshold_db: 10.0,
+        close_threshold_db: 6.0,
+        hang_seconds: 0.5,
+        rows_per_second: ROWS_PER_SECOND,
+        min_separation_hz: if narrow { 12_500.0 } else { 150_000.0 },
+        // skip the LO leakage zone plus a bit of slop; the tuned signal sits
+        // SHIFT_HZ away from DC so it's not hidden by this exclusion
+        dc_skip_hz: 50_000.0,
+    });
+
+    let mut spec = Spectrum::new(FFT_SIZE);
+    let mut buf = vec![0u8; 262_144];
+    let mut iq: Vec<Complex32> = Vec::with_capacity(buf.len() / 2);
+    let mut events: Vec<Event> = Vec::new();
+    let mut pushed = 0usize;
+    let started = std::time::Instant::now();
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+
+    while !stop.load(Ordering::Relaxed) {
+        let n = match hackrf.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("hackrf read error: {e:#}");
+                continue;
+            }
+        };
+        iq.clear();
+        for chunk in buf[..n].chunks_exact(2) {
+            let i = (chunk[0] as i8) as f32 / 128.0;
+            let q = (chunk[1] as i8) as f32 / 128.0;
+            iq.push(Complex32::new(i, q));
+        }
+
+        let mut s = 0;
+        while s + FFT_SIZE <= iq.len() {
+            spec.push(&iq[s..s + FFT_SIZE]);
+            pushed += 1;
+            s += FFT_SIZE;
+            if pushed == AVG_FFTS {
+                let row = spec.take();
+                events.clear();
+                detector.step(&row, tuned_to as f64, &mut events);
+                let t_ms = started.elapsed().as_millis() as u64;
+                for ev in &events {
+                    match ev {
+                        Event::Open(st) => {
+                            writeln!(
+                                out,
+                                r#"{{"t_ms":{},"event":"open","id":{},"freq_hz":{:.0},"power_db":{:.2}}}"#,
+                                t_ms, st.id, st.freq_hz, st.power_db
+                            )?;
+                        }
+                        Event::Close { id, freq_hz } => {
+                            writeln!(
+                                out,
+                                r#"{{"t_ms":{},"event":"close","id":{},"freq_hz":{:.0}}}"#,
+                                t_ms, id, freq_hz
+                            )?;
+                        }
+                    }
+                }
+                out.flush()?;
+                pushed = 0;
+            }
+        }
+    }
+    hackrf.stop()?;
+    eprintln!("\nscan stopped cleanly.");
+    Ok(())
+}
+
+fn fleet(freq_hz: u64, k: usize) -> anyhow::Result<()> {
+    const FFT_SIZE: usize = 1024;
+    const AVG_FFTS: usize = 64;
+    const ROWS_PER_SECOND: f32 =
+        RADIO_SAMPLE_RATE_HZ as f32 / (FFT_SIZE as f32 * AVG_FFTS as f32);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_handler = stop.clone();
+    ctrlc::set_handler(move || {
+        stop_handler.store(true, Ordering::Relaxed);
+    })?;
+
+    // audio sink: same ring/cpal setup as play() and waterfall
+    let (mut producer, consumer) = RingBuffer::<f32>::new(16_384);
+    for _ in 0..8_192 {
+        let _ = producer.push(0.0);
+    }
+    let _audio_out = audio::start(consumer)?;
+
+    let hackrf = HackRf::open_first()?;
+    let tuned_to = freq_hz + SHIFT_HZ;
+    hackrf.start_rx(&Config {
+        txvga_db: 0,
+        vga_db: 16,
+        lna_db: 16,
+        amp_enable: false,
+        antenna_enable: false,
+        frequency_hz: tuned_to,
+        sample_rate_hz: RADIO_SAMPLE_RATE_HZ,
+        sample_rate_div: 1,
+    })?;
+    eprintln!(
+        "fleet: K={} tuned to {:.3} MHz (center {:.3} MHz + {} kHz LO offset)",
+        k,
+        tuned_to as f64 / 1e6,
+        freq_hz as f64 / 1e6,
+        SHIFT_HZ / 1000,
+    );
+
+    let mut detector = PeakDetector::new(PeakParams {
+        sample_rate_hz: RADIO_SAMPLE_RATE_HZ as f32,
+        fft_size: FFT_SIZE,
+        open_threshold_db: 10.0,
+        close_threshold_db: 6.0,
+        hang_seconds: 0.5,
+        rows_per_second: ROWS_PER_SECOND,
+        min_separation_hz: 150_000.0,
+        dc_skip_hz: 50_000.0,
+    });
+    let mut peak_events = Vec::new();
+    let mut fleet = Fleet::new(k, tuned_to as f64);
+
+    let mut spec = Spectrum::new(FFT_SIZE);
+    let mut buf = vec![0u8; 262_144];
+    let mut iq: Vec<Complex32> = Vec::with_capacity(buf.len() / 2);
+    let mut scratch_c: Vec<Complex32> = Vec::new();
+    let mut scratch_decim: Vec<Complex32> = Vec::new();
+    let mut scratch_audio_hi: Vec<f32> = Vec::new();
+    let mut scratch_audio: Vec<f32> = Vec::new();
+    let mut mono_mix: Vec<f32> = Vec::new();
+    let mut pushed = 0usize;
+    let mut iters: u64 = 0;
+    let mut drops: u64 = 0;
+
+    let inv_k = 1.0 / k as f32;
+
+    while !stop.load(Ordering::Relaxed) {
+        let n = match hackrf.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("hackrf read error: {e:#}");
+                continue;
+            }
+        };
+        iq.clear();
+        for chunk in buf[..n].chunks_exact(2) {
+            let i = (chunk[0] as i8) as f32 / 128.0;
+            let q = (chunk[1] as i8) as f32 / 128.0;
+            iq.push(Complex32::new(i, q));
+        }
+
+        // process every active slot, then sample-wise sum into mono_mix
+        let mut mix_len = 0usize;
+        for slot in fleet.slots.iter_mut().filter(|s| s.freq_hz != 0.0) {
+            slot.process(
+                &iq,
+                &mut scratch_c,
+                &mut scratch_decim,
+                &mut scratch_audio_hi,
+                &mut scratch_audio,
+            );
+            mix_len = mix_len.max(slot.out.len());
+        }
+        mono_mix.clear();
+        mono_mix.resize(mix_len, 0.0);
+        for slot in fleet.slots.iter().filter(|s| s.freq_hz != 0.0) {
+            for (m, &s) in mono_mix.iter_mut().zip(&slot.out) {
+                *m += s * inv_k;
+            }
+        }
+        for &s in &mono_mix {
+            if producer.push(s).is_err() {
+                drops += 1;
+            }
+        }
+
+        // FFT path: feed bins, detect peaks every AVG_FFTS, update fleet on each row
+        let mut s_idx = 0;
+        while s_idx + FFT_SIZE <= iq.len() {
+            spec.push(&iq[s_idx..s_idx + FFT_SIZE]);
+            pushed += 1;
+            s_idx += FFT_SIZE;
+            if pushed == AVG_FFTS {
+                let row = spec.take();
+                peak_events.clear();
+                detector.step(&row, tuned_to as f64, &mut peak_events);
+                let stations = detector.snapshot(tuned_to as f64);
+                fleet.update(&stations);
+                pushed = 0;
+            }
+        }
+
+        iters += 1;
+        if iters.is_multiple_of(20) {
+            let mut parts: Vec<String> = Vec::with_capacity(fleet.slots.len());
+            for (i, slot) in fleet.slots.iter().enumerate() {
+                if slot.freq_hz == 0.0 {
+                    parts.push(format!("slot{i}=idle"));
+                } else {
+                    parts.push(format!("slot{i}={:.3}MHz", slot.freq_hz / 1e6));
+                }
+            }
+            eprintln!("{} drops={drops}", parts.join(" "));
+        }
+    }
+    hackrf.stop()?;
+    eprintln!("\nfleet stopped cleanly. drops={drops}");
+    Ok(())
+}
+
+fn spatial(freq_hz: u64, k: usize, speed_mps: f32) -> anyhow::Result<()> {
+    const FFT_SIZE: usize = 1024;
+    const AVG_FFTS: usize = 64;
+    const ROWS_PER_SECOND: f32 =
+        RADIO_SAMPLE_RATE_HZ as f32 / (FFT_SIZE as f32 * AVG_FFTS as f32);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_handler = stop.clone();
+    ctrlc::set_handler(move || {
+        stop_handler.store(true, Ordering::Relaxed);
+    })?;
+
+    // stereo ring + sink
+    let (mut producer, consumer) = RingBuffer::<f32>::new(32_768);
+    for _ in 0..16_384 {
+        let _ = producer.push(0.0);
+    }
+    let _audio_out = audio::start_stereo(consumer)?;
+
+    let hackrf = HackRf::open_first()?;
+    let tuned_to = freq_hz + SHIFT_HZ;
+    hackrf.start_rx(&Config {
+        txvga_db: 0,
+        vga_db: 16,
+        lna_db: 16,
+        amp_enable: false,
+        antenna_enable: false,
+        frequency_hz: tuned_to,
+        sample_rate_hz: RADIO_SAMPLE_RATE_HZ,
+        sample_rate_div: 1,
+    })?;
+
+    let mut spatial = SpatialMixer::new(tuned_to as f64);
+    // band edges in hallway meters: ±(sample_rate/2) / hz_per_meter
+    let edge_m = (RADIO_SAMPLE_RATE_HZ as f32 / 2.0) / spatial.hz_per_meter;
+    let mut walk_dir: f32 = 1.0;
+    spatial.camera_x = -edge_m;
+
+    eprintln!(
+        "spatial: K={} tuned to {:.3} MHz, hallway ±{:.1}m, walking {} m/s",
+        k, tuned_to as f64 / 1e6, edge_m, speed_mps,
+    );
+
+    let mut detector = PeakDetector::new(PeakParams {
+        sample_rate_hz: RADIO_SAMPLE_RATE_HZ as f32,
+        fft_size: FFT_SIZE,
+        open_threshold_db: 10.0,
+        close_threshold_db: 6.0,
+        hang_seconds: 0.5,
+        rows_per_second: ROWS_PER_SECOND,
+        min_separation_hz: 150_000.0,
+        dc_skip_hz: 50_000.0,
+    });
+    let mut peak_events = Vec::new();
+    let mut fleet = Fleet::new(k, tuned_to as f64);
+
+    let mut spec = Spectrum::new(FFT_SIZE);
+    let mut buf = vec![0u8; 262_144];
+    let mut iq: Vec<Complex32> = Vec::with_capacity(buf.len() / 2);
+    let mut scratch_c: Vec<Complex32> = Vec::new();
+    let mut scratch_decim: Vec<Complex32> = Vec::new();
+    let mut scratch_audio_hi: Vec<f32> = Vec::new();
+    let mut scratch_audio: Vec<f32> = Vec::new();
+    let mut stereo_mix: Vec<f32> = Vec::new();
+    let mut pushed = 0usize;
+    let mut iters: u64 = 0;
+    let mut drops: u64 = 0;
+
+    // block duration in audio seconds: ~131k IQ samples / 2.4M = ~54.6ms
+    const BLOCK_SECONDS: f32 = (262_144 / 2) as f32 / RADIO_SAMPLE_RATE_HZ as f32;
+
+    while !stop.load(Ordering::Relaxed) {
+        let n = match hackrf.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("hackrf read error: {e:#}");
+                continue;
+            }
+        };
+        iq.clear();
+        for chunk in buf[..n].chunks_exact(2) {
+            let i = (chunk[0] as i8) as f32 / 128.0;
+            let q = (chunk[1] as i8) as f32 / 128.0;
+            iq.push(Complex32::new(i, q));
+        }
+
+        // advance the camera, ping-pong at edges
+        spatial.camera_x += walk_dir * speed_mps * BLOCK_SECONDS;
+        if spatial.camera_x > edge_m {
+            spatial.camera_x = edge_m;
+            walk_dir = -1.0;
+        } else if spatial.camera_x < -edge_m {
+            spatial.camera_x = -edge_m;
+            walk_dir = 1.0;
+        }
+
+        // process active slots
+        for slot in fleet.slots.iter_mut().filter(|s| s.freq_hz != 0.0) {
+            slot.process(
+                &iq,
+                &mut scratch_c,
+                &mut scratch_decim,
+                &mut scratch_audio_hi,
+                &mut scratch_audio,
+            );
+        }
+
+        // collect (samples, freq) for the spatial mixer
+        let streams = fleet
+            .slots
+            .iter()
+            .filter(|s| s.freq_hz != 0.0)
+            .map(|s| (s.out.as_slice(), s.freq_hz));
+        spatial.mix(streams, &mut stereo_mix);
+
+        for &s in &stereo_mix {
+            if producer.push(s).is_err() {
+                drops += 1;
+            }
+        }
+
+        // FFT path: same cadence as fleet()
+        let mut s_idx = 0;
+        while s_idx + FFT_SIZE <= iq.len() {
+            spec.push(&iq[s_idx..s_idx + FFT_SIZE]);
+            pushed += 1;
+            s_idx += FFT_SIZE;
+            if pushed == AVG_FFTS {
+                let row = spec.take();
+                peak_events.clear();
+                detector.step(&row, tuned_to as f64, &mut peak_events);
+                let stations = detector.snapshot(tuned_to as f64);
+                fleet.update(&stations);
+                pushed = 0;
+            }
+        }
+
+        iters += 1;
+        if iters.is_multiple_of(20) {
+            let parts: Vec<String> = fleet
+                .slots
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    if s.freq_hz == 0.0 {
+                        format!("slot{i}=idle")
+                    } else {
+                        let (lg, rg) = spatial.channel_gains(s.freq_hz);
+                        format!(
+                            "slot{i}={:.2}MHz L{:.2}R{:.2}",
+                            s.freq_hz / 1e6,
+                            lg,
+                            rg
+                        )
+                    }
+                })
+                .collect();
+            eprintln!(
+                "cam={:+.1}m {} drops={}",
+                spatial.camera_x,
+                parts.join(" "),
+                drops
+            );
+        }
+    }
+    hackrf.stop()?;
+    eprintln!("\nspatial stopped cleanly. drops={drops}");
+    Ok(())
 }
 
 fn capture() {
